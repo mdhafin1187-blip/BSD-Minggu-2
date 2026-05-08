@@ -1,0 +1,448 @@
+A. Database studi_kasus_oee
+
+1. Membuat database
+
+use studi_kasus_oee
+
+2. Membuat dokumen 
+
+db.produksi_harian.drop();
+
+var docs = [];
+var mesinList = [];
+
+for (let i = 1; i <= 10; i++) {
+    mesinList.push("M" + i.toString().padStart(2, '0'));
+}
+
+var start = new Date(2026, 3, 1);
+
+for (let i = 0; i < 1000; i++) {
+    var tgl = new Date(
+        start.getTime() + Math.floor(Math.random() * 90) * 86400000
+    );
+
+    var shift = Math.floor(Math.random() * 3) + 1;
+    var target = Math.floor(Math.random() * 301) + 200;
+
+    var actual_ok = Math.floor(target * (0.6 + Math.random() * 0.4));
+    var actual_reject = Math.floor(actual_ok * Math.random() * 0.15);
+
+    var durasi_tersedia = 480;
+    var durasi_operasi = Math.floor(
+        durasi_tersedia * (0.7 + Math.random() * 0.3)
+    );
+
+    docs.push({
+        mesin: mesinList[Math.floor(Math.random() * 10)],
+        tanggal: tgl,
+        shift: shift,
+        target: target,
+        actual_ok: actual_ok,
+        actual_reject: actual_reject,
+        durasi_operasi_menit: durasi_operasi,
+        durasi_tersedia_menit: durasi_tersedia
+    });
+
+    if (docs.length === 500) {
+        db.produksi_harian.insertMany(docs);
+        docs = [];
+    }
+}
+
+if (docs.length) {
+    db.produksi_harian.insertMany(docs);
+}
+
+3. Pipeline Lengkap
+
+db.produksi_harian.aggregate([
+  // Tahap 1: Tidak perlu $match karena ingin semua data
+  // Tahap 2: Group by mesin dan bulan
+  { $group: {
+      _id: {
+        mesin: "$mesin",
+        bulan: { $month: "$tanggal" },
+        tahun: { $year: "$tanggal" }
+      },
+      total_target: { $sum: "$target" },
+      total_ok: { $sum: "$actual_ok" },
+      total_reject: { $sum: "$actual_reject" },
+      total_op: { $sum: "$durasi_operasi_menit" },
+      total_avail: { $sum: "$durasi_tersedia_menit" }
+  }},
+  // Tahap 3: Hitung OEE
+  { $project: {
+      _id: 0,
+      mesin: "$_id.mesin",
+      bulan: "$_id.bulan",
+      tahun: "$_id.tahun",
+      total_ok: 1,
+      total_target: 1,
+      total_reject: 1,
+      availability: { $divide: ["$total_op", "$total_avail"] },
+      performance: { $divide: ["$total_ok", "$total_target"] },
+      quality: { $divide: ["$total_ok", { $add: ["$total_ok", "$total_reject"] } ] },
+      OEE: {
+        $multiply: [
+          { $divide: ["$total_ok", "$total_target"] },
+          { $divide: ["$total_op", "$total_avail"] },
+          { $divide: ["$total_ok", { $add: ["$total_ok", "$total_reject"] } ] }
+        ]
+      }
+  }},
+  // Tahap 4: Urutkan berdasarkan OEE terendah
+  { $sort: { OEE: 1 } }
+])
+
+4. MENEMUKAN MESIN DENGAN OEE DI BAWAH 80%
+
+db.produksi_harian.aggregate([
+  // Tahap 1: Tidak perlu $match karena ingin semua data
+  // Tahap 2: Group by mesin dan bulan
+  { $group: {
+      _id: {
+        mesin: "$mesin",
+        bulan: { $month: "$tanggal" },
+        tahun: { $year: "$tanggal" }
+      },
+      total_target: { $sum: "$target" },
+      total_ok: { $sum: "$actual_ok" },
+      total_reject: { $sum: "$actual_reject" },
+      total_op: { $sum: "$durasi_operasi_menit" },
+      total_avail: { $sum: "$durasi_tersedia_menit" }
+  }},
+  // Tahap 3: Hitung OEE
+  { $project: {
+      _id: 0,
+      mesin: "$_id.mesin",
+      bulan: "$_id.bulan",
+      tahun: "$_id.tahun",
+      total_ok: 1,
+      total_target: 1,
+      total_reject: 1,
+      availability: { $divide: ["$total_op", "$total_avail"] },
+      performance: { $divide: ["$total_ok", "$total_target"] },
+      quality: { $divide: ["$total_ok", { $add: ["$total_ok", "$total_reject"] } ] },
+      OEE: {
+        $multiply: [
+          { $divide: ["$total_ok", "$total_target"] },
+          { $divide: ["$total_op", "$total_avail"] },
+          { $divide: ["$total_ok", { $add: ["$total_ok", "$total_reject"] } ] }
+        ]
+      }
+  }},
+  // Tahap 4: Urutkan berdasarkan OEE terendah
+  { $sort: { OEE: 1 } }
+])
+
+5. DISTRIBUSI JUMLAH PRODUKSI PER SHIFT DALAM BUCKET
+
+db.produksi_harian.aggregate([
+  { $bucket: {
+      groupBy: "$actual_ok",
+      boundaries: [0, 200, 300, 400, 600], // 0-199, 200-299, 300-399, 400-600
+      default: "di atas 600",
+      output: {
+        count: { $sum: 1 },
+        rata_reject: { $avg: "$actual_reject" }
+      }
+  }}
+])
+
+Namun ini belum dipisah per shift. Untuk distribusi per shift, kita bisa $group atau $facet. Misal kita ingin tiga bucket terpisah untuk setiap shift:
+
+db.produksi_harian.aggregate([
+  { $group: {
+      _id: "$shift",
+      data: { $push: "$actual_ok" }  // kumpulkan nilai
+  }},])
+
+Gunakan $facet untuk menjalankan pipeline bucket paralel per shift:
+
+db.produksi_harian.aggregate([
+  { $facet: {
+      "shift1": [
+        { $match: { shift: 1 } },
+        { $bucket: { groupBy: "$actual_ok", boundaries: [0,200,300,400,600], default: "600+", output: { count: {$sum:1} } } }
+      ],
+      "shift2": [
+        { $match: { shift: 2 } },
+        { $bucket: { groupBy: "$actual_ok", boundaries: [0,200,300,400,600], default: "600+", output: { count: {$sum:1} } } }
+      ],
+      "shift3": [
+        { $match: { shift: 3 } },
+        { $bucket: { groupBy: "$actual_ok", boundaries: [0,200,300,400,600], default: "600+", output: { count: {$sum:1} } } }
+      ]
+  }}
+])
+
+Cara lain – lebih sederhana: Jika hanya ingin jumlah per shift, gunakan $group langsung: db.produksi_harian.aggregate([
+
+db.produksi_harian.aggregate([
+  { $group: { _id: "$shift", total_produksi: { $sum: "$actual_ok" } } }
+
+B. Database tugas5_225443015
+
+1. Membuat database
+
+use tugas5_225443015
+
+2. Generate Data Dummy 
+
+db.inspeksi.drop()
+db.target_kualitas.drop()
+
+const mesin_list = Array.from({ length: 10 }, (_, i) => `M${String(i+1).padStart(2,'0')}`)
+const batch_ids = Array.from({ length: 2000 }, (_, i) => `B${String(i+1).padStart(4,'0')}`)
+const inspektor_list = ["Andi", "Budi", "Citra", "Dian", "Eka"]
+const jenis_cacat_options = ["gores", "retak", "bengkok", "warna", "dimensi", "pori"]
+
+// =====================
+// Generate data inspeksi
+// =====================
+let docs = []
+let start_date = new Date(2026, 3, 1, 6, 0) // bulan di JS mulai dari 0 (3 = April)
+
+for (let i = 0; i < 1500; i++) {
+let batch = batch_ids[Math.floor(Math.random() * batch_ids.length)]
+let mesin = mesin_list[Math.floor(Math.random() * mesin_list.length)]
+
+let tanggal = new Date(start_date)
+tanggal.setMinutes(tanggal.getMinutes() + Math.floor(Math.random() * 60 * 24 * 90))
+
+let jam = tanggal.getHours()
+let shift = jam < 14 ? 1 : (jam < 22 ? 2 : 3)
+
+let jumlah = Math.floor(Math.random() * 401) + 100
+let reject = Math.floor(jumlah * (Math.random() * 0.10))
+
+let shuffled = [...jenis_cacat_options].sort(() => 0.5 - Math.random())
+let jenis = shuffled.slice(0, Math.floor(Math.random() * 3) + 1)
+
+docs.push({
+batch_id: batch,
+mesin: mesin,
+tanggal: tanggal,
+shift: shift,
+inspektor: inspektor_list[Math.floor(Math.random() * inspektor_list.length)],
+jumlah_diperiksa: jumlah,
+cacat_ditemukan: reject,
+jenis_cacat: jenis
+})
+
+if (docs.length >= 500) {
+db.inspeksi.insertMany(docs)
+docs = []
+}
+}
+
+if (docs.length > 0) {
+db.inspeksi.insertMany(docs)
+}
+
+print("Data inspeksi selesai. Total:", db.inspeksi.countDocuments())
+
+// =====================
+// Generate target kualitas
+// =====================
+let targets = []
+
+for (let i = 1; i <= 2000; i++) {
+let batch = `B${String(i).padStart(4,'0')}`
+let target_cacat = Math.floor(Math.random() * 15) + 1
+
+targets.push({
+batch_id: batch,
+target_maks_cacat: target_cacat
+})
+
+if (targets.length >= 500) {
+db.target_kualitas.insertMany(targets)
+targets = []
+}
+}
+
+if (targets.length > 0) {
+db.target_kualitas.insertMany(targets)
+}
+
+print("Data target kualitas selesai. Total:", db.target_kualitas.countDocuments())
+
+3. Memastikan data siap
+
+db.inspeksi.countDocuments()  
+db.target_kualitas.countDocuments()  
+db.inspeksi.findOne()
+db.target_kualitas.findOne()
+ 
+db.inspeksi.createIndex({ batch_id: 1 })
+db.inspeksi.createIndex({ mesin: 1, tanggal: 1 })
+db.target_kualitas.createIndex({ batch_id: 1 })
+
+4. Pipeline 1: Persentase Cacat per Batch
+
+db.inspeksi.aggregate([
+  {
+    $addFields: {
+      persen_cacat: {
+        $multiply: [
+          { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] },
+          100
+        ]
+      }
+    }
+  },
+  { $sort: { persen_cacat: -1 } },
+  { $limit: 10 }
+])
+
+5. Pipeline 2: Gabung dengan Target dan Tentukan Status Batch
+db.inspeksi.aggregate([
+  {
+    $lookup: {
+      from: "target_kualitas",
+      localField: "batch_id",
+      foreignField: "batch_id",
+      as: "target_info"
+    }
+  },
+  {
+    $unwind: {
+      path: "$target_info",
+      preserveNullAndEmptyArrays: false
+    }
+  },
+  {
+    $addFields: {
+      persen_cacat: {
+        $cond: [
+          { $eq: ["$jumlah_diperiksa", 0] },
+          0,
+          {
+            $multiply: [
+              { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] },
+              100
+            ]
+          }
+        ]
+      },
+      target_maks: "$target_info.target_maks_cacat"
+    }
+  },
+  {
+    $addFields: {
+      status: {
+        $cond: {
+          if: { $gt: ["$persen_cacat", "$target_maks"] },
+          then: "NOT OK",
+          else: "OK"
+        }
+      }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      batch_id: 1,
+      mesin: 1,
+      persen_cacat: 1,
+      target_maks: 1,
+      status: 1,
+      selisih: {
+        $subtract: ["$persen_cacat", "$target_maks"]
+      }
+    }
+  },
+  { $sort: { selisih: -1 } },
+  { $limit: 10 }   
+])
+
+6. Pipeline 3: Jumlah Batch NOT OK per Mesin per Minggu
+
+db.inspeksi.aggregate([
+  { $lookup: {
+      from: "target_kualitas",
+      localField: "batch_id",
+      foreignField: "batch_id",
+      as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+      persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }
+  }},
+  { $addFields: {
+      status: { $cond: { if: { $gt: ["$persen_cacat", "$target_info.target_maks_cacat"] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $match: { status: "NOT OK" } },
+  { $group: {
+      _id: {
+        mesin: "$mesin",
+        minggu: { $week: "$tanggal" },
+        tahun: { $year: "$tanggal" }
+      },
+      jumlah_NOT_OK: { $sum: 1 }
+  }},
+  { $sort: { "_id.tahun": 1, "_id.minggu": 1, "_id.mesin": 1 } }
+])
+
+7. Pipeline 4: Top 3 Mesin dengan Jumlah NOT OK Terbanyak (dalam satu bulan tertentu)
+
+db.inspeksi.aggregate([
+  { $match: {
+      tanggal: { $gte: ISODate("2026-05-01"), $lt: ISODate("2026-06-01") }
+  }},
+  { $lookup: {
+      from: "target_kualitas",
+      localField: "batch_id",
+      foreignField: "batch_id",
+      as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+      persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }
+  }},
+  { $addFields: {
+      status: { $cond: { if: { $gt: ["$persen_cacat", "$target_info.target_maks_cacat"] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $match: { status: "NOT OK" } },
+  { $group: {
+      _id: "$mesin",
+      total_NOT_OK: { $sum: 1 }
+  }},
+  { $sort: { total_NOT_OK: -1 } },
+  { $limit: 3 }
+])
+
+8. Pipeline 5 (Bonus/Opsional): Ringkasan Bulanan dengan $facet
+
+db.inspeksi.aggregate([
+  { $match: { tanggal: { $gte: ISODate("2026-06-01"), $lt: ISODate("2026-07-01") } } },
+  { $lookup: {
+      from: "target_kualitas",
+      localField: "batch_id",
+      foreignField: "batch_id",
+      as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+      persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] },
+      status: { $cond: { if: { $gt: [ { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }, "$target_info.target_maks_cacat" ] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $facet: {
+      "total_batch": [
+        { $count: "count" }
+      ],
+      "rata_cacat": [
+        { $group: { _id: null, avg_cacat: { $avg: "$persen_cacat" } } }
+      ],
+      "mesin_terburuk": [
+        { $match: { status: "NOT OK" } },
+        { $group: { _id: "$mesin", jumlah: { $sum: 1 } } },
+        { $sort: { jumlah: -1 } },
+        { $limit: 3 }
+      ]
+  }}
+]) 
+
+
